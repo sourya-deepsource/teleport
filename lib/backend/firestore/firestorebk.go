@@ -19,11 +19,12 @@ package firestore
 import (
 	"bytes"
 	"context"
-	"strings"
+	"encoding/base64"
 	"time"
 
 	"cloud.google.com/go/firestore"
 	apiv1 "cloud.google.com/go/firestore/apiv1/admin"
+	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/utils"
@@ -199,6 +200,10 @@ func New(ctx context.Context, params backend.Params) (*FirestoreBackend, error) 
 		cancel()
 		return nil, trace.Wrap(err)
 	}
+	// Admin client is only used for building indexes at startup.
+	// It won't be needed after New returns.
+	defer firestoreAdminClient.Close()
+
 	buf, err := backend.NewCircularBuffer(ctx, cfg.BufferSize)
 	if err != nil {
 		cancel()
@@ -237,20 +242,20 @@ func New(ctx context.Context, params backend.Params) (*FirestoreBackend, error) 
 
 // Create creates item if it does not exist
 func (b *FirestoreBackend) Create(ctx context.Context, item backend.Item) (*backend.Lease, error) {
-	var r record
-	r.Key = string(item.Key)
-	r.Value = string(item.Value)
-	r.Timestamp = b.clock.Now().UTC().Unix()
-	r.ID = b.clock.Now().UTC().UnixNano()
+	r := record{
+		Key:       string(item.Key),
+		Value:     string(item.Value),
+		Timestamp: b.clock.Now().UTC().Unix(),
+		ID:        b.clock.Now().UTC().UnixNano(),
+	}
 	if !item.Expires.IsZero() {
 		r.Expires = item.Expires.UTC().Unix()
 	}
-	_, err := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(item.Key)).Create(ctx, r)
+	_, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Create(ctx, r)
 	if err != nil {
 		return nil, ConvertGRPCError(err)
-	} else {
-		return b.newLease(item), nil
 	}
+	return b.newLease(item), nil
 }
 
 // Put puts value into backend (creates if it does not exists, updates it otherwise)
@@ -263,7 +268,7 @@ func (b *FirestoreBackend) Put(ctx context.Context, item backend.Item) (*backend
 	if !item.Expires.IsZero() {
 		r.Expires = item.Expires.UTC().Unix()
 	}
-	_, err := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(item.Key)).Set(ctx, r)
+	_, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Set(ctx, r)
 	if err != nil {
 		return nil, ConvertGRPCError(err)
 	} else {
@@ -281,11 +286,11 @@ func (b *FirestoreBackend) Update(ctx context.Context, item backend.Item) (*back
 	if !item.Expires.IsZero() {
 		r.Expires = item.Expires.UTC().Unix()
 	}
-	_, err := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(item.Key)).Get(ctx)
+	_, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Get(ctx)
 	if err != nil {
 		return nil, ConvertGRPCError(err)
 	}
-	_, err = b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(item.Key)).Set(ctx, r)
+	_, err = b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(item.Key)).Set(ctx, r)
 	if err != nil {
 		return nil, ConvertGRPCError(err)
 	} else {
@@ -364,7 +369,7 @@ func (b *FirestoreBackend) Get(ctx context.Context, key []byte) (*backend.Item, 
 	if len(key) == 0 {
 		return nil, trace.BadParameter("missing parameter key")
 	}
-	docSnap, err := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(key)).Get(ctx)
+	docSnap, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(key)).Get(ctx)
 	if err != nil {
 		return nil, ConvertGRPCError(err)
 	}
@@ -408,7 +413,7 @@ func (b *FirestoreBackend) CompareAndSwap(ctx context.Context, expected backend.
 		return nil, trace.BadParameter("expected and replaceWith keys should match")
 	}
 
-	expectedDocSnap, err := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(expected.Key)).Get(ctx)
+	expectedDocSnap, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(expected.Key)).Get(ctx)
 	if err != nil {
 		return nil, trace.CompareFailed("error or object not found, error: %v", ConvertGRPCError(err))
 	}
@@ -446,7 +451,7 @@ func (b *FirestoreBackend) Delete(ctx context.Context, key []byte) error {
 	if len(key) == 0 {
 		return trace.BadParameter("missing parameter key")
 	}
-	docRef := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(key))
+	docRef := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(key))
 	doc, _ := docRef.Get(ctx)
 
 	if !doc.Exists() {
@@ -478,7 +483,7 @@ func (b *FirestoreBackend) KeepAlive(ctx context.Context, lease backend.Lease, e
 	if len(lease.Key) == 0 {
 		return trace.BadParameter("lease is missing key")
 	}
-	docSnap, err := b.svc.Collection(b.CollectionName).Doc(b.convertKeyToSupportedDocumentID(lease.Key)).Get(ctx)
+	docSnap, err := b.svc.Collection(b.CollectionName).Doc(b.keyToDocumentID(lease.Key)).Get(ctx)
 	if err != nil {
 		return ConvertGRPCError(err)
 	}
@@ -534,10 +539,14 @@ func (b *FirestoreBackend) newLease(item backend.Item) *backend.Lease {
 	return &lease
 }
 
-// convertKeyToSupportedDocumentID converts the key for the stored member to one supported by Firestore
-func (b *FirestoreBackend) convertKeyToSupportedDocumentID(key []byte) string {
-	return strings.Replace(strings.Replace(string(key), documentNameLockIllegalCharacter, documentNameLockReplacementCharacter, 1),
-		documentNameIllegalCharacter, documentNameReplacementCharacter, -1)
+// keyToDocumentID converts key to a format supported by Firestore for document
+// IDs. See
+// https://firebase.google.com/docs/firestore/quotas#collections_documents_and_fields
+// for Firestore limitations.
+func (b *FirestoreBackend) keyToDocumentID(key []byte) string {
+	// URL-safe base64 will not have periods or forward slashes.
+	// This should satisfy the Firestore requirements.
+	return base64.URLEncoding.EncodeToString(key)
 }
 
 // RetryingAsyncFunctionRunner wraps a task target in retry logic
@@ -673,14 +682,11 @@ func (b *FirestoreBackend) getIndexParent() string {
 }
 
 func (b *FirestoreBackend) ensureIndexes(adminSvc *apiv1.FirestoreAdminClient) error {
-	defer adminSvc.Close()
-	tuples := make([]*IndexTuple, 0)
-	tuples = append(tuples, &IndexTuple{
+	tuples := []*IndexTuple{{
 		FirstField:  keyDocProperty,
 		SecondField: expiresDocProperty,
-	})
-	err := EnsureIndexes(b.clientContext, adminSvc, tuples, b.getIndexParent())
-	return err
+	}}
+	return EnsureIndexes(b.clientContext, adminSvc, tuples, b.getIndexParent())
 }
 
 type IndexTuple struct {
@@ -693,22 +699,23 @@ type IndexTuple struct {
 func EnsureIndexes(ctx context.Context, adminSvc *apiv1.FirestoreAdminClient, tuples []*IndexTuple, indexParent string) error {
 	l := log.WithFields(log.Fields{trace.Component: BackendName})
 
-	ascendingFieldOrder := adminpb.Index_IndexField_Order_{
+	ascendingFieldOrder := &adminpb.Index_IndexField_Order_{
 		Order: adminpb.Index_IndexField_ASCENDING,
 	}
 
 	tuplesToIndexNames := make(map[*IndexTuple]string)
 	// create the indexes
 	for _, tuple := range tuples {
-		fields := make([]*adminpb.Index_IndexField, 0)
-		fields = append(fields, &adminpb.Index_IndexField{
-			FieldPath: tuple.FirstField,
-			ValueMode: &ascendingFieldOrder,
-		})
-		fields = append(fields, &adminpb.Index_IndexField{
-			FieldPath: tuple.SecondField,
-			ValueMode: &ascendingFieldOrder,
-		})
+		fields := []*adminpb.Index_IndexField{
+			{
+				FieldPath: tuple.FirstField,
+				ValueMode: ascendingFieldOrder,
+			},
+			{
+				FieldPath: tuple.SecondField,
+				ValueMode: ascendingFieldOrder,
+			},
+		}
 		operation, err := adminSvc.CreateIndex(ctx, &adminpb.CreateIndexRequest{
 			Parent: indexParent,
 			Index: &adminpb.Index{
@@ -716,26 +723,31 @@ func EnsureIndexes(ctx context.Context, adminSvc *apiv1.FirestoreAdminClient, tu
 				Fields:     fields,
 			},
 		})
-		if err != nil && status.Convert(err).Code() != codes.AlreadyExists {
+		if err != nil && status.Code(err) != codes.AlreadyExists {
 			l.Debug("non-already exists error, returning.")
 			return ConvertGRPCError(err)
 		}
-		if operation != nil {
-			meta := adminpb.IndexOperationMetadata{}
-			_ = meta.XXX_Unmarshal(operation.Metadata.Value)
-			tuplesToIndexNames[tuple] = meta.Index
+
+		meta := adminpb.IndexOperationMetadata{}
+		if err := proto.Unmarshal(operation.Metadata.Value, &meta); err != nil {
+			return trace.Wrap(err)
 		}
+		tuplesToIndexNames[tuple] = meta.Index
 	}
 
+	// Instead of polling the Index state, we should wait for the Operation to
+	// finish. Also, there should ideally be a timeout on index creation.
+
 	// check for statuses and block
-	for {
-		if len(tuplesToIndexNames) == 0 {
-			break
-		}
+	for len(tuplesToIndexNames) != 0 {
 		time.Sleep(timeInBetweenIndexCreationStatusChecks)
 		for tuple, name := range tuplesToIndexNames {
-			index, _ := adminSvc.GetIndex(ctx, &adminpb.GetIndexRequest{Name: name})
-			l.Infof("Index for tuple %s-%s, %s, state is %s.", tuple.FirstField, tuple.SecondField, index.Name, index.State.String())
+			index, err := adminSvc.GetIndex(ctx, &adminpb.GetIndexRequest{Name: name})
+			if err != nil {
+				l.Warningf("error fetching index %q: %v", name, err)
+				continue
+			}
+			l.Infof("Index for tuple %s-%s, %s, state is %s.", tuple.FirstField, tuple.SecondField, index.Name, index.State)
 			if index.State == adminpb.Index_READY {
 				delete(tuplesToIndexNames, tuple)
 			}
