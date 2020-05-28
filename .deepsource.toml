@@ -19,3 +19,4 @@ enabled = true
   [analyzers.meta]
   import_path = "github.com/gravitational/teleport"
   dependencies_vendored = true
+  build_tags = ["fips", "pam", "bpf"]
